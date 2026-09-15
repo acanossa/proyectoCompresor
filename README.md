@@ -8,7 +8,7 @@ Programa de línea de comandos para Debian 13. Comprime recursivamente los archi
 make
 ```
 
-Solo necesita `gcc` y `make`; MD5 está implementado en el propio programa y no requiere OpenSSL.
+Solo se necesita `gcc` y `make`
 
 ## Uso
 
@@ -16,5 +16,3 @@ Solo necesita `gcc` y `make`; MD5 está implementado en el propio programa y no 
 ./compresor compress <directorio> <archivo.huf>
 ./compresor extract  <archivo.huf> <directorio>
 ```
-
-La extracción rechaza rutas absolutas y rutas con `..`. Cada archivo se verifica después de escribirlo; si el MD5 no coincide, se elimina el archivo afectado y el comando termina con error. El programa procesa los archivos secuencialmente.
