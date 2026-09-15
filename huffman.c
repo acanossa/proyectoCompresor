@@ -10,9 +10,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#define MAGIC "HUF1"
+#define MAGIC "HUF1"          // Firma mágica del formato de archivo comprimido
 #define MAX_PATH_LEN 65535u
 
+// Estructura para almacenar rutas de archivos a comprimir
 typedef struct {
     char *path;
 } InputFile;
@@ -23,11 +24,12 @@ typedef struct {
     size_t capacity;
 } FileList;
 
+// Nodo del árbol de Huffman
 typedef struct {
-    uint64_t frequency;
-    int left;
-    int right;
-    int symbol;
+    uint64_t frequency;  // Suma de frecuencias (nodos internos)
+    int left;            // Índice del nodo izquierdo
+    int right;           // Índice del nodo derecho
+    int symbol;          // Símbolo (0-255) si es hoja, -1 si es nodo interno
 } HuffmanNode;
 
 typedef struct {
@@ -36,11 +38,12 @@ typedef struct {
     int count;
 } HuffmanTree;
 
+// Contexto MD5: mantiene el estado de la función hash durante el cálculo
 typedef struct {
-    uint32_t state[4];
-    uint64_t bit_count;
-    unsigned char buffer[64];
-    size_t buffer_used;
+    uint32_t state[4];      // Estado interno del hash
+    uint64_t bit_count;     // Cantidad de bits procesados
+    unsigned char buffer[64]; // Buffer para acumular datos
+    size_t buffer_used;     // Bytes utilizados en el buffer actual
 } Md5;
 
 static void md5_init(Md5 *md5);
@@ -122,6 +125,8 @@ static void free_file_list(FileList *list) {
     free(list->items);
 }
 
+// Recorre recursivamente un directorio y recopila todos los archivos regulares
+// (excluye directorios, enlaces simbólicos, etc.)
 static int collect_files(const char *directory, const char *relative, FileList *list) {
     char full_path[4096];
     int written = snprintf(full_path, sizeof(full_path), "%s%s%s", directory,
@@ -131,6 +136,7 @@ static int collect_files(const char *directory, const char *relative, FileList *
         return -1;
     }
 
+    // Abre el directorio para lectura
     DIR *dir = opendir(full_path);
     if (dir == NULL) {
         fprintf(stderr, "No se puede abrir %s: %s\n", full_path, strerror(errno));
@@ -169,19 +175,25 @@ static int collect_files(const char *directory, const char *relative, FileList *
     return result;
 }
 
+// Construye un árbol de Huffman a partir de las frecuencias de los símbolos
+// agrupa repetidamente los dos nodos de menor frecuencia
 static void tree_build(HuffmanTree *tree, const uint64_t frequencies[256]) {
-    int active[511];
+    int active[511];  // Índices de nodos activos (hojas o padres recientes)
     int active_count = 0;
     tree->count = 0;
+    
+    // Crear nodos hoja para cada símbolo que aparece en el archivo
     for (int symbol = 0; symbol < 256; ++symbol) {
         if (frequencies[symbol] == 0) continue;
         tree->nodes[tree->count] = (HuffmanNode){frequencies[symbol], -1, -1, symbol};
         active[active_count++] = tree->count++;
     }
     if (active_count == 0) {
-        tree->root = -1;
+        tree->root = -1;  // Archivo vacío
         return;
     }
+    
+    // Combinar nodos hasta tener un solo árbol raíz
     while (active_count > 1) {
         int first = 0, second = 1;
         if (tree->nodes[active[second]].frequency < tree->nodes[active[first]].frequency ||
@@ -200,29 +212,38 @@ static void tree_build(HuffmanTree *tree, const uint64_t frequencies[256]) {
                 second = i;
             }
         }
+        // Crear un nodo padre combinando los dos nodos más pequeños
         int first_node = active[first], second_node = active[second];
         tree->nodes[tree->count] = (HuffmanNode){
             tree->nodes[first_node].frequency + tree->nodes[second_node].frequency,
-            first_node, second_node, -1};
-        active[first] = tree->count++;
-        active[second] = active[--active_count];
+            first_node, second_node, -1};  // -1 --> nodo interno
+        active[first] = tree->count++;     // Sustituir el primer nodo por el padre
+        active[second] = active[--active_count];  // Eliminar el segundo nodo
     }
     tree->root = active[0];
 }
 
+// Genera códigos binarios Huffman recorriendo el árbol de forma recursiva
+// 0 para la rama izquierda, 1 para la rama derecha
 static void make_codes(const HuffmanTree *tree, int node, char codes[256][256], char *path, int depth) {
+    // Caso base: hoja del árbol (símbolo encontrado)
     if (tree->nodes[node].symbol >= 0) {
-        if (depth == 0) path[depth++] = '0';
+        if (depth == 0) path[depth++] = '0';  // archivo con un único símbolo
         path[depth] = '\0';
         strcpy(codes[tree->nodes[node].symbol], path);
         return;
     }
+    // Caso recursivo: descender por las ramas izquierda y derecha
     path[depth] = '0';
     make_codes(tree, tree->nodes[node].left, codes, path, depth + 1);
     path[depth] = '1';
     make_codes(tree, tree->nodes[node].right, codes, path, depth + 1);
 }
 
+// Lee un archivo y recopila:
+// Frecuencias de cada byte
+// Tamaño total del archivo
+// Firma MD5
 static int scan_file(const char *path, uint64_t frequencies[256], uint64_t *size, unsigned char digest[16]) {
     FILE *file = fopen(path, "rb");
     if (file == NULL) return -1;
@@ -232,6 +253,7 @@ static int scan_file(const char *path, uint64_t frequencies[256], uint64_t *size
     md5_init(&md5);
     unsigned char buffer[8192];
     size_t length;
+    // Leer en bloques y actualizar frecuencias, tamaño y MD5
     while ((length = fread(buffer, 1, sizeof(buffer), file)) != 0) {
         for (size_t i = 0; i < length; ++i) ++frequencies[buffer[i]];
         *size += length;
@@ -243,18 +265,21 @@ static int scan_file(const char *path, uint64_t frequencies[256], uint64_t *size
     return result;
 }
 
+// Codifica datos usando el árbol de Huffman: reemplaza cada símbolo por su código binario
 static int encode_file(FILE *archive, const char *path, char codes[256][256], uint64_t bit_count) {
     FILE *file = fopen(path, "rb");
     if (file == NULL) return -1;
-    unsigned char out = 0;
-    int bits = 0;
+    unsigned char out = 0;   // Acumulador de bits
+    int bits = 0;            // Cantidad de bits en el acumulador
     unsigned char input[8192];
     size_t length;
     while ((length = fread(input, 1, sizeof(input), file)) != 0) {
         for (size_t i = 0; i < length; ++i) {
+            // Procesar cada bit del código Huffman del símbolo
             for (const char *code = codes[input[i]]; *code != '\0'; ++code) {
                 out = (unsigned char)((out << 1) | (*code == '1'));
                 if (++bits == 8) {
+                    // Escribir un byte completo cuando acumulamos 8 bits
                     if (write_bytes(archive, &out, 1) != 0) { fclose(file); return -1; }
                     out = 0;
                     bits = 0;
@@ -262,6 +287,7 @@ static int encode_file(FILE *archive, const char *path, char codes[256][256], ui
             }
         }
     }
+    // Rellenar con ceros a la izquierda
     if (ferror(file) || (bits > 0 && write_bytes(archive, &(unsigned char){(unsigned char)(out << (8 - bits))}, 1) != 0)) {
         fclose(file);
         return -1;
@@ -271,6 +297,7 @@ static int encode_file(FILE *archive, const char *path, char codes[256][256], ui
     return 0;
 }
 
+// Comprime recursivamente todos los archivos de un directorio en un archivo HUF
 static int compress_directory(const char *directory, const char *archive_path) {
     struct stat info;
     if (stat(directory, &info) != 0 || !S_ISDIR(info.st_mode)) {
@@ -287,6 +314,7 @@ static int compress_directory(const char *directory, const char *archive_path) {
         return 1;
     }
     int result = 0;
+    // Escribir encabezado: firma mágica y cantidad de archivos
     if (write_bytes(archive, MAGIC, 4) != 0 || write_u32(archive, (uint32_t)list.count) != 0) result = -1;
     for (size_t i = 0; i < list.count && result == 0; ++i) {
         char source[4096];
@@ -328,18 +356,22 @@ static int compress_directory(const char *directory, const char *archive_path) {
     return 0;
 }
 
+// Verifica que una ruta no intente escapar del directorio de extracción
+// Rechaza rutas absolutas y referencias a directorios padre (..)
 static int safe_relative_path(const char *path) {
     if (path[0] == '/' || strstr(path, "\\") != NULL) return 0;
     const char *part = path;
     while (*part != '\0') {
         const char *end = strchr(part, '/');
         size_t length = end == NULL ? strlen(part) : (size_t)(end - part);
-        if (length == 0 || (length == 2 && strncmp(part, "..", 2) == 0)) return 0;
+        if (length == 0 || (length == 2 && strncmp(part, "..", 2) == 0)) return 0;  // Rechazar
         part = end == NULL ? part + length : end + 1;
     }
     return 1;
 }
 
+// Crea recursivamente todos los directorios necesarios para una ruta de archivo
+// Si un directorio ya existe, no falla
 static int make_parent_directories(const char *path) {
     char copy[4096];
     if (strlen(path) >= sizeof(copy)) return -1;
@@ -352,11 +384,15 @@ static int make_parent_directories(const char *path) {
     return 0;
 }
 
+// Descodifica datos comprimidos usando el árbol de Huffman
+// Lee bits secuencialmente, siguiendo el árbol hasta encontrar hojas
 static int decode_file(FILE *archive, const HuffmanTree *tree, uint64_t bit_count, uint64_t size, FILE *output) {
     unsigned char input;
     int node = tree->root;
     uint64_t produced = 0;
+    // Archivo vacío
     if (tree->root < 0) return size == 0 && bit_count == 0 ? 0 : -1;
+    // Archivo con un único símbolo distinto
     if (tree->nodes[tree->root].symbol >= 0) {
         unsigned char byte = (unsigned char)tree->nodes[tree->root].symbol;
         for (uint64_t i = 0; i < size; ++i) if (fwrite(&byte, 1, 1, output) != 1) return -1;
@@ -365,11 +401,15 @@ static int decode_file(FILE *archive, const HuffmanTree *tree, uint64_t bit_coun
         }
         return bit_count == size ? 0 : -1;
     }
+    // Descodificación normal: leer bits y descender por el árbol
     for (uint64_t bit = 0; bit < bit_count; ++bit) {
         if (bit % 8 == 0 && read_bytes(archive, &input, 1) != 0) return -1;
+        // Extraer el bit en la posición actual
         int value = (input >> (7 - (bit % 8))) & 1;
+        // Descender por la rama correspondiente
         node = value ? tree->nodes[node].right : tree->nodes[node].left;
         if (node < 0 || node >= tree->count) return -1;
+        // Si llegamos a una hoja, escribir el símbolo y volver a la raíz
         if (tree->nodes[node].symbol >= 0) {
             unsigned char byte = (unsigned char)tree->nodes[node].symbol;
             if (fwrite(&byte, 1, 1, output) != 1) return -1;
@@ -380,14 +420,18 @@ static int decode_file(FILE *archive, const HuffmanTree *tree, uint64_t bit_coun
     return produced == size && node == tree->root ? 0 : -1;
 }
 
+// Descomprime un archivo HUF y verifica cada archivo mediante MD5
+// Si la verificación falla, elimina el archivo corrupto y reporta error
 static int extract_archive(const char *archive_path, const char *directory) {
     FILE *archive = fopen(archive_path, "rb");
     if (archive == NULL) { fprintf(stderr, "No se puede abrir %s: %s\n", archive_path, strerror(errno)); return 1; }
+    // Validar encabezado del archivo
     char magic[4];
     uint32_t file_count;
     int result = read_bytes(archive, magic, 4) != 0 || memcmp(magic, MAGIC, 4) != 0 || read_u32(archive, &file_count) != 0;
     if (result != 0) { fprintf(stderr, "Archivo HUF inválido.\n"); fclose(archive); return 1; }
     if (mkdir(directory, 0755) != 0 && errno != EEXIST) { fclose(archive); return 1; }
+    // Procesar cada archivo almacenado
     for (uint32_t file_number = 0; file_number < file_count && result == 0; ++file_number) {
         uint16_t path_length, symbol_count;
         uint64_t size, bit_count, frequencies[256] = {0};
@@ -420,6 +464,7 @@ static int extract_archive(const char *archive_path, const char *directory) {
             result = -1;
             break;
         }
+        // Verificar que el archivo descomprimido coincide con el MD5 original
         FILE *check = fopen(output_path, "rb");
         Md5 md5;
         md5_init(&md5);
@@ -428,9 +473,12 @@ static int extract_archive(const char *archive_path, const char *directory) {
         while (check != NULL && (read_count = fread(buffer, 1, sizeof(buffer), check)) != 0) md5_update(&md5, buffer, read_count);
         unsigned char actual[16];
         if (check == NULL || ferror(check)) result = -1;
-        else { md5_final(&md5, actual); if (memcmp(expected, actual, 16) != 0) result = -2; }
+        else { 
+            md5_final(&md5, actual); 
+            if (memcmp(expected, actual, 16) != 0) result = -2;  // MD5 no coincide: archivo corrupto
+        }
         if (check != NULL) fclose(check);
-        if (result != 0) { unlink(output_path); break; }
+        if (result != 0) { unlink(output_path); break; }  // Eliminar archivo corrupto
         printf("Verificado: %s\n", path);
     }
     fclose(archive);
@@ -450,6 +498,7 @@ static void md5_transform(Md5 *md5, const unsigned char block[64]) {
     md5->state[0]+=a; md5->state[1]+=b; md5->state[2]+=c; md5->state[3]+=d;
 }
 
+// Inicializar estado MD5 con valores estándar RFC 1321
 static void md5_init(Md5 *md5) { md5->state[0]=0x67452301; md5->state[1]=0xefcdab89; md5->state[2]=0x98badcfe; md5->state[3]=0x10325476; md5->bit_count=0; md5->buffer_used=0; }
 static void md5_update(Md5 *md5, const unsigned char *data, size_t length) { md5->bit_count += (uint64_t)length*8; while(length){ size_t copy=64-md5->buffer_used; if(copy>length)copy=length; memcpy(md5->buffer+md5->buffer_used,data,copy); md5->buffer_used+=copy; data+=copy; length-=copy; if(md5->buffer_used==64){md5_transform(md5,md5->buffer);md5->buffer_used=0;} } }
 static void md5_final(Md5 *md5, unsigned char digest[16]) { uint64_t bits=md5->bit_count; unsigned char pad[64]={0x80}; md5_update(md5,pad,md5->buffer_used<56?56-md5->buffer_used:120-md5->buffer_used); unsigned char length[8]; for(int i=0;i<8;++i)length[i]=(unsigned char)(bits>>(8*i)); md5_update(md5,length,8); for(int i=0;i<4;++i) for(int j=0;j<4;++j) digest[i*4+j]=(unsigned char)(md5->state[i]>>(8*j)); }
