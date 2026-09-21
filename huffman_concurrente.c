@@ -81,7 +81,16 @@ typedef struct {
     uint64_t size;
     unsigned char expected[16];
     uint32_t file_number;
+    int status;
 } ExtractionTask;
+
+// Información compartida por los hilos de descompresión
+typedef struct {
+    ExtractionTask *tasks;
+    size_t task_count;
+    size_t next_index;
+    pthread_mutex_t mutex;
+} ExtractionContext;
 
 static void md5_init(Md5 *md5);
 static void md5_update(Md5 *md5, const unsigned char *data, size_t length);
@@ -841,6 +850,54 @@ static int extract_file(
     return 0;
 }
 
+// Función ejecutada por cada hilo de descompresión
+static void *extraction_worker(void *argument)
+{
+    ExtractionContext *context = argument;
+
+    while (1) {
+        size_t index;
+
+        // Proteger el índice compartido
+        pthread_mutex_lock(&context->mutex);
+
+        if (context->next_index >= context->task_count) {
+            pthread_mutex_unlock(&context->mutex);
+            break;
+        }
+
+        index = context->next_index;
+        context->next_index++;
+
+        pthread_mutex_unlock(&context->mutex);
+
+        ExtractionTask *task = &context->tasks[index];
+
+        FILE *compressed = fopen(task->temp_path, "rb");
+
+        if (compressed == NULL) {
+            task->status = -1;
+            continue;
+        }
+
+        // Descomprimir y verificar el MD5
+        task->status = extract_file(
+            compressed,
+            task->output_path,
+            &task->tree,
+            task->bit_count,
+            task->size,
+            task->expected
+        );
+
+        if (fclose(compressed) != 0 &&
+            task->status == 0) {
+            task->status = -1;
+        }
+    }
+
+    return NULL;
+}
 
 // Copia los datos comprimidos de un archivo a un archivo temporal
 static int copy_data(FILE *archive, FILE *temp, uint64_t bit_count) {
@@ -864,45 +921,105 @@ static int copy_data(FILE *archive, FILE *temp, uint64_t bit_count) {
     return 0;
 }
 
-
-// Descomprime un archivo HUF y verifica cada archivo mediante MD5
-// Si la verificación falla, elimina el archivo corrupto y reporta error
-static int extract_archive(const char *archive_path, const char *directory) {
+// Descomprime un archivo HUF utilizando un grupo de hilos
+static int extract_archive(
+    const char *archive_path,
+    const char *directory
+) {
     FILE *archive = fopen(archive_path, "rb");
-    if (archive == NULL) { fprintf(stderr, "No se puede abrir %s: %s\n", archive_path, strerror(errno)); return 1; }
-    // Validar encabezado del archivo
+
+    if (archive == NULL) {
+        fprintf(
+            stderr,
+            "No se puede abrir %s: %s\n",
+            archive_path,
+            strerror(errno)
+        );
+        return 1;
+    }
+
     char magic[4];
     uint32_t file_count;
-    int result = read_bytes(archive, magic, 4) != 0 || memcmp(magic, MAGIC, 4) != 0 || read_u32(archive, &file_count) != 0;
-    if (result != 0) { fprintf(stderr, "Archivo HUF inválido.\n"); fclose(archive); return 1; }
-    if (mkdir(directory, 0755) != 0 && errno != EEXIST) { fclose(archive); return 1; }
-    ExtractionTask *tasks = calloc(file_count, sizeof(ExtractionTask));
 
-    if (tasks == NULL) {
+    int result =
+        read_bytes(archive, magic, 4) != 0 ||
+        memcmp(magic, MAGIC, 4) != 0 ||
+        read_u32(archive, &file_count) != 0;
+
+    if (result != 0) {
+        fprintf(stderr, "Archivo HUF invalido.\n");
         fclose(archive);
         return 1;
     }
-    // Procesar cada archivo almacenado
-    for (uint32_t file_number = 0; file_number < file_count && result == 0; ++file_number) {
-        uint16_t path_length, symbol_count;
+
+    if (mkdir(directory, 0755) != 0 && errno != EEXIST) {
+        fclose(archive);
+        return 1;
+    }
+
+    ExtractionTask *tasks = NULL;
+
+    if (file_count > 0) {
+        tasks = calloc(file_count, sizeof(*tasks));
+
+        if (tasks == NULL) {
+            fclose(archive);
+            return 1;
+        }
+    }
+
+    for (uint32_t file_number = 0;
+         file_number < file_count && result == 0;
+         ++file_number) {
+
+        ExtractionTask *task = &tasks[file_number];
+
+        uint16_t path_length;
+        uint16_t symbol_count;
         uint64_t frequencies[256] = {0};
         char path[4096];
-        // Obtener la tarea correspondiente al archivo actual
-        ExtractionTask *task = &tasks[file_number];
-        if (read_u16(archive, &path_length) != 0 || path_length == 0 || path_length >= sizeof(path) ||
-            read_bytes(archive, path, path_length) != 0) { result = -1; break; }
+
+        if (read_u16(archive, &path_length) != 0 ||
+            path_length == 0 ||
+            path_length >= sizeof(path) ||
+            read_bytes(archive, path, path_length) != 0) {
+            result = -1;
+            break;
+        }
+
         path[path_length] = '\0';
-        if (!safe_relative_path(path) || read_u64(archive, &task->size) != 0 || read_bytes(archive, task->expected, 16) != 0 ||
-            read_u16(archive, &symbol_count) != 0 || symbol_count > 256) { result = -1; break; }
+
+        if (!safe_relative_path(path) ||
+            read_u64(archive, &task->size) != 0 ||
+            read_bytes(archive, task->expected, 16) != 0 ||
+            read_u16(archive, &symbol_count) != 0 ||
+            symbol_count > 256) {
+            result = -1;
+            break;
+        }
+
         for (uint16_t i = 0; i < symbol_count; ++i) {
             unsigned char symbol;
-            if (read_bytes(archive, &symbol, 1) != 0 || read_u64(archive, &frequencies[symbol]) != 0 || frequencies[symbol] == 0) { result = -1; break; }
+
+            if (read_bytes(archive, &symbol, 1) != 0 ||
+                read_u64(
+                    archive,
+                    &frequencies[symbol]
+                ) != 0 ||
+                frequencies[symbol] == 0) {
+                result = -1;
+                break;
+            }
         }
-        if (result != 0 || read_u64(archive, &task->bit_count) != 0) { result = -1; break; }
-        // Construir el árbol de Huffman a partir de las frecuencias
+
+        if (result != 0 ||
+            read_u64(archive, &task->bit_count) != 0) {
+            result = -1;
+            break;
+        }
+
         tree_build(&task->tree, frequencies);
 
-        // Construir la ruta del archivo de salida
         int length = snprintf(
             task->output_path,
             sizeof(task->output_path),
@@ -919,158 +1036,181 @@ static int extract_archive(const char *archive_path, const char *directory) {
         }
 
         task->file_number = file_number;
+        task->status = -1;
 
-        /*
-         * Crear un archivo temporal para almacenar
-         * los datos comprimidos de este archivo.
-         */
         length = snprintf(
             task->temp_path,
             sizeof(task->temp_path),
-            "/tmp/huf_extract_%ld_%u.tmp",
+            "/tmp/huf_extract_thread_%ld_%u.tmp",
             (long)getpid(),
             file_number
         );
 
-        if (length < 0 || (size_t)length >= sizeof(task->temp_path)) {
+        if (length < 0 ||
+            (size_t)length >= sizeof(task->temp_path)) {
             result = -1;
             break;
         }
 
-        FILE *temp = fopen(task->temp_path, "wb");
+        FILE *temporary = fopen(task->temp_path, "wb");
 
-        if (temp == NULL) {
+        if (temporary == NULL) {
             result = -1;
             break;
         }
 
-        // Copiar los datos comprimidos del archivo HUF al temporal
-        if (copy_data(archive, temp, task->bit_count) != 0) {
-            fclose(temp);
+        if (copy_data(
+                archive,
+                temporary,
+                task->bit_count
+            ) != 0) {
+            fclose(temporary);
             unlink(task->temp_path);
+            task->temp_path[0] = '\0';
             result = -1;
             break;
         }
 
-        fclose(temp);
-
-        // Crear el pipe para comunicar el resultado del hijo
-        if (pipe(task->pipe_fd) != 0) {
+        if (fclose(temporary) != 0) {
             unlink(task->temp_path);
+            task->temp_path[0] = '\0';
             result = -1;
             break;
         }
+    }
 
-        // Crear el proceso hijo
-        task->child = fork();
+    pthread_t *threads = NULL;
+    size_t thread_count = 0;
+    size_t created_threads = 0;
+    int mutex_initialized = 0;
 
-        if (task->child < 0) {
-            fprintf(stderr, "Error al crear proceso.\n");
-            close(task->pipe_fd[0]);
-            close(task->pipe_fd[1]);
-            unlink(task->temp_path);
-            result = -1;
-            break;
+    ExtractionContext context = {
+        .tasks = tasks,
+        .task_count = file_count,
+        .next_index = 0
+    };
+
+    if (result == 0 && file_count > 0) {
+        thread_count = get_processor_count();
+
+        if (thread_count > file_count) {
+            thread_count = file_count;
         }
 
-        if (task->child == 0) {
+        threads = calloc(thread_count, sizeof(*threads));
 
-            // El hijo solamente escribe en el pipe
-            close(task->pipe_fd[0]);
+        if (threads == NULL) {
+            result = -1;
+        }
+    }
 
-            FILE *compressed = fopen(task->temp_path, "rb");
+    if (result == 0 && file_count > 0) {
+        if (pthread_mutex_init(&context.mutex, NULL) != 0) {
+            fprintf(stderr, "No se pudo inicializar el mutex.\n");
+            result = -1;
+        } else {
+            mutex_initialized = 1;
+        }
+    }
 
-            if (compressed == NULL) {
-                ExtractionResult message = {-1, task->file_number};
+    // Crear los hilos de descompresión
+    if (result == 0 && file_count > 0) {
+        for (size_t i = 0; i < thread_count; ++i) {
+            int thread_result = pthread_create(
+                &threads[i],
+                NULL,
+                extraction_worker,
+                &context
+            );
 
-                write(
-                    task->pipe_fd[1],
-                    &message,
-                    sizeof(message)
+            if (thread_result != 0) {
+                fprintf(
+                    stderr,
+                    "No se pudo crear el hilo %zu: %s\n",
+                    i,
+                    strerror(thread_result)
                 );
 
-                close(task->pipe_fd[1]);
-                _exit(EXIT_FAILURE);
+                result = -1;
+                break;
             }
 
-            // Descomprimir el archivo y verificar su MD5
-            int extract_result = extract_file(
-                compressed,
-                task->output_path,
-                &task->tree,
-                task->bit_count,
-                task->size,
-                task->expected
-            );
-
-            fclose(compressed);
-
-            // Preparar el resultado para el padre
-            ExtractionResult message;
-
-            message.status = extract_result;
-            message.file_number = task->file_number;
-
-            // Enviar el resultado al proceso padre
-            write(task->pipe_fd[1], &message, sizeof(message));
-
-            close(task->pipe_fd[1]);
-
-            _exit(
-                extract_result == 0
-                ? EXIT_SUCCESS
-                : EXIT_FAILURE
-            );
+            created_threads++;
         }
-
-        // El padre solamente leerá el resultado después
-        close(task->pipe_fd[1]);
     }
 
-        // Recibir los resultados de todos los procesos hijos
+    // Esperar a que todos los hilos terminen
+    for (size_t i = 0; i < created_threads; ++i) {
+        int join_result = pthread_join(threads[i], NULL);
+
+        if (join_result != 0) {
+            fprintf(
+                stderr,
+                "No se pudo esperar al hilo %zu: %s\n",
+                i,
+                strerror(join_result)
+            );
+
+            result = -1;
+        }
+    }
+
+    // Revisar los resultados y MD5 de cada archivo
+    if (result == 0) {
+        for (uint32_t i = 0; i < file_count; ++i) {
+            if (tasks[i].status != 0) {
+                result = tasks[i].status;
+                break;
+            }
+
+            printf("Verificado: %s\n", tasks[i].output_path);
+        }
+    }
+
+    // Eliminar todos los temporales
     for (uint32_t i = 0; i < file_count; ++i) {
-
-        ExtractionTask *task = &tasks[i];
-
-        ExtractionResult message;
-
-        // Recibir el resultado enviado por el hijo
-        ssize_t bytes_read = read(task->pipe_fd[0], &message, sizeof(message));
-
-        close(task->pipe_fd[0]);
-
-        // Esperar a que termine el proceso hijo
-        int child_status;
-
-        if (waitpid(task->child, &child_status, 0) < 0) {
-            result = -1;
+        if (tasks != NULL &&
+            tasks[i].temp_path[0] != '\0') {
+            unlink(tasks[i].temp_path);
         }
-        else if (bytes_read != sizeof(message)) {
-            result = -1;
-        }
-        else if (message.status != 0) {
-            result = message.status;
-        }
-        else if (!WIFEXITED(child_status) ||
-                 WEXITSTATUS(child_status) != EXIT_SUCCESS) {
-            result = -1;
-        }
-
-        unlink(task->temp_path);
-
-        if (result != 0)
-            break;
-
-        printf("Verificado: %s\n", task->output_path);
     }
 
-    fclose(archive);
+    if (mutex_initialized) {
+        pthread_mutex_destroy(&context.mutex);
+    }
+
+    free(threads);
     free(tasks);
 
-    if (result != 0) { fprintf(stderr, result == -2 ? "Error MD5: archivo corrupto (%s).\n" : "Archivo HUF corrupto.\n", archive_path); return 1; }
-    printf("Extraídos y verificados %u archivos en %s\n", file_count, directory);
+    if (fclose(archive) != 0) {
+        result = -1;
+    }
+
+    if (result != 0) {
+        if (result == -2) {
+            fprintf(
+                stderr,
+                "Error MD5: archivo corrupto (%s).\n",
+                archive_path
+            );
+        } else {
+            fprintf(stderr, "Archivo HUF corrupto.\n");
+        }
+
+        return 1;
+    }
+
+    printf(
+        "Extraidos y verificados %u archivos "
+        "concurrentemente con %zu hilos en %s\n",
+        file_count,
+        thread_count,
+        directory
+    );
+
     return 0;
 }
+
 
 static uint32_t left_rotate(uint32_t value, uint32_t amount) { return (value << amount) | (value >> (32 - amount)); }
 
