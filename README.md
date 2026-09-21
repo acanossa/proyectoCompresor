@@ -15,4 +15,6 @@ Solo se necesita `gcc` y `make`
 ```sh
 ./compresor compress <directorio> <archivo.huf>
 ./compresor extract  <archivo.huf> <directorio>
+./compresor_paralelo compress <directorio> <archivo.huf>
+./compresor_paralelo extract  <archivo.huf> <directorio>
 ```
