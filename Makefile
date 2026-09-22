@@ -1,6 +1,6 @@
 CC ?= gcc
 
-CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
+CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic -D_XOPEN_SOURCE=700
 
 .PHONY: all clean
 
