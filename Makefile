@@ -4,7 +4,7 @@ CFLAGS ?= -std=c11 -O2 -Wall -Wextra -Wpedantic
 
 .PHONY: all clean
 
-all: compresor compresor_paralelo compresor_concurrente
+all: compresor compresor_paralelo compresor_concurrente comparador
 
 compresor: huffman.c
 	$(CC) $(CFLAGS) -o $@ $<
@@ -15,5 +15,8 @@ compresor_paralelo: huffman_paralelo.c
 compresor_concurrente: huffman_concurrente.c
 	$(CC) $(CFLAGS) -pthread -o $@ $<
 
+comparador: comparador.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -f compresor compresor_paralelo compresor_concurrente
+	rm -f compresor compresor_paralelo compresor_concurrente comparador
