@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-"""Interfaz GTK 4 actualizada: incluye el botón Limpiar."""
 
 from __future__ import annotations
 
@@ -287,7 +285,6 @@ class MainWindow(Gtk.ApplicationWindow):
     @staticmethod
     def _percent(value: float) -> str:
         # comparador.c usa -1 para indicar que la métrica no aplica.
-        # Otros valores negativos sí son válidos: significan que esa versión
         # fue más lenta que la serial.
         return "—" if value == -1.0 else f"{value:.2f}%"
 
@@ -328,8 +325,6 @@ class MainWindow(Gtk.ApplicationWindow):
 
 class Application(Gtk.Application):
     def __init__(self) -> None:
-        # NON_UNIQUE evita que GTK redirija esta ejecución a una copia vieja
-        # de la interfaz que pudiera haber quedado abierta.
         super().__init__(
             application_id="org.proyectocompresor.huffman",
             flags=Gio.ApplicationFlags.NON_UNIQUE,
